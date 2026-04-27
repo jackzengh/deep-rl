@@ -289,7 +289,6 @@ def trainer(
 
             state = next_state
 
-
             # train our agent at every step
             agent.train_step(batch_size=batch_size)
 
