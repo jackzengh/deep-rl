@@ -1,3 +1,5 @@
+###  https://github.com/priyammaz/PyTorch-Adventures/blob/8546809993cd6fd11e152f0e23d2969fc5516906/PyTorch%20for%20Reinforcement%20Learning/Intro%20to%20Deep%20Reinforcement%20Learning/Prioritized%20Experience%20Replay/prioritized_experience_replay.ipynb#L53
+
 import os
 import numpy as np
 import torch
@@ -27,7 +29,10 @@ class DuelingDQN(nn.Module):
         self.fc1 = nn.Linear(input_state_features, hidden_features) # transform from 8 to hidden_features
         self.fc2 = nn.Linear(hidden_features, hidden_features)
 
+        # value of state
         self.value = nn.Linear(hidden_features, 1)
+
+        # advantage of each action
         self.advantage = nn.Linear(hidden_features, num_actions) 
 
     def forward(self, x): # where x is the input, shaped as (B, input_state_features)
@@ -47,9 +52,9 @@ class DuelingDQN(nn.Module):
 
 
 # Create timecapsule replay buffer (storing memory of our steps and associated rewards), access_memory, insert_memory
-class TimeCapsule:
+class TimeCapsulePER:
 
-    def __init__(self, max_memory=100_000, num_state_features=8):
+    def __init__(self, max_memory=100_000, num_state_features=8, beta=0.4, alpha=0.6, eps=1e-6):
 
         self.max_memory = max_memory
         self.num_state_features = num_state_features
@@ -63,8 +68,14 @@ class TimeCapsule:
         self.reward_memory = torch.zeros((self.max_memory, ), dtype=torch.float32)
         self.terminal_memory = torch.zeros((self.max_memory,), dtype=torch.bool)
 
+        self.current_memories_counter = 0
 
-    def add_memory(self, state, next_state, action, reward, terminal): 
+        self.priorities = torch.zeros((self.max_memory, ), dtype=torch.float32)
+        self.beta = beta
+        self.alpha = alpha
+        self.eps = eps
+
+    def add_memory(self, state, next_state, action, reward, terminal, td_error): 
 
         # we want to add to each from the start of their respective arrays, [1,2,3,4,5], [6,2,3,4,5]
 
@@ -80,6 +91,9 @@ class TimeCapsule:
         self.reward_memory[idx] = torch.tensor(reward, dtype=self.reward_memory.dtype)
         self.terminal_memory[idx] = torch.tensor(terminal, dtype=self.terminal_memory.dtype)
 
+        # build the priorities array which is delta ** alpha
+        self.priorities[idx] = torch.tensor(abs(td_error) + self.eps, dtype=self.priorities.dtype) ** self.alpha
+
         # add to current_memories_counter
         self.current_memories_counter += 1
 
@@ -93,18 +107,29 @@ class TimeCapsule:
         if total_memories < batch_size: 
             return None # back out, we don't have enough memories to retrieve yet
 
-        # # sample memories at random, we want to first get an array of random array indexes from 0 -> total_memories, then we index into the arrays with those indexes
-        batch_indices = np.random.choice(total_memories, batch_size, replace=False)
-        batch_indices = torch.tensor(batch_indices, dtype=torch.long)
+        # compute probabilities of sampling each memory
+        priorities = self.priorities[:total_memories]
+        probabilities = priorities / priorities.sum()
+        
+        # sample random indices based on probabilities, retrieving batch_size number of indices
+        rand_sample_idx = torch.multinomial(probabilities, num_samples=batch_size, replace=False).to(dtype=torch.long)
 
-        # instead of sampling at random, we want to sample based on the importance sampling ratio
+        # now weight each sampled memory, by 1/N * 1/P(i)
+        weights = (total_memories * probabilities[rand_sample_idx]) ** -self.beta # N * P(i)
+        weights = weights / weights.max()
+
+        # sample memories at random, we want to first get an array of random array indexes from 0 -> total_memories, then we index into the arrays with those indexes
+        # batch_indices = np.random.choice(total_memories, batch_size, replace=False)
+        # batch_indices = torch.tensor(batch_indices, dtype=torch.long)
 
         # whenever you access data you must move it to your device to then perform training on 
-        batch = {"states": self.state_memory[batch_indices].to(device),
-                 "next_states": self.next_state_memory[batch_indices].to(device),
-                 "actions": self.action_memory[batch_indices].to(device),
-                 "rewards": self.reward_memory[batch_indices].to(device),
-                 "terminal": self.terminal_memory[batch_indices].to(device)}
+        batch = {"states": self.state_memory[rand_sample_idx].to(device),
+                 "next_states": self.next_state_memory[rand_sample_idx].to(device),
+                 "actions": self.action_memory[rand_sample_idx].to(device),
+                 "rewards": self.reward_memory[rand_sample_idx].to(device),
+                 "terminal": self.terminal_memory[rand_sample_idx].to(device),
+                 "indices": rand_sample_idx,
+                 "weights": weights.to(device)}
 
         return batch
 
@@ -138,10 +163,9 @@ class Agent:
         # device as the model. Mixing CPU and MPS/CUDA tensors in one op raises a RuntimeError.
         self.device = device
 
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.MSELoss(reduction="none")
 
-        self.time_capsule = TimeCapsule(max_memory=max_memories, num_state_features=input_state_features)
-
+        self.time_capsule = TimeCapsulePER(max_memory=max_memories, num_state_features=input_state_features)
 
         self.DQN = DuelingDQN(input_state_features, hidden_features, num_actions).to(device)
         
@@ -222,18 +246,19 @@ class Agent:
             q_next_action_estimate = self.DQN(batch["next_states"]) # input a (B,8) tensor, output a (B,4) tensor
             action_index = q_next_action_estimate.argmax(axis=-1, keepdim=True) # outputs a (B,1) tensor with the index of the action
             qnext_next_action_estimate = self.DQN_NEXT(batch["next_states"]) # output type is (B,4) tensor
-            max_qnext_estimate = torch.gather(qnext_next_action_estimate, index=action_index, dim=1) # index into each batches action array, pluck out the DQN-selected action index
+            max_qnext_estimate = torch.gather(qnext_next_action_estimate, index=action_index, dim=1).squeeze(1) # index into each batches action array, pluck out the DQN-selected action index
             # self.DQN.train()
 
         # compare the Q value of the TD error with the current Q value for that state action pair
         # max_q_next_estimate = q_next_estimate.max(axis=-1).values # returning (B, 1) which is the value of the action you take in the next state for every batch
 
-
         # compute the TD target (which is the TD error, but you don't subtract what the current Q_sa value is)
-        td_target = batch["rewards"] + self.time_decay * max_q_next_estimate * (~batch["terminal"])
+        td_target = batch["rewards"] + self.time_decay * max_qnext_estimate * (~batch["terminal"])
 
+        ### need to compute weighted loss due to importance sampling ###
         # compute loss
-        loss = self.loss_fn(td_target, max_q_estimate)
+        # loss = self.loss_fn(td_target, max_q_estimate)
+        loss = (batch["weights"] * self.loss_fn(td_target, max_q_estimate)).mean()
 
         # ensure there are no old gradients in the optimizer
         self.optimizer.zero_grad()
@@ -301,8 +326,12 @@ def trainer(
             next_state, reward, terminal, truncated, _ = env.step(action)
             done = terminal or truncated
 
+            ### setting the TD error to the max priority for now ###
+            td_error = agent.time_capsule.priorities.max() if agent.time_capsule.current_memories_counter > 0 else 1.0
+
+            ### added a TD error to the replay buffer ###
             # add to our replay buffer for training later
-            agent.time_capsule.add_memory(state, next_state, action, reward, terminal)
+            agent.time_capsule.add_memory(state, next_state, action, reward, terminal, td_error)
 
             state = next_state
 
@@ -426,3 +455,4 @@ agent, log = trainer(env, device=device)
 
 # After training, watch the trained agent play one episode.
 visualize_agent(agent)
+
